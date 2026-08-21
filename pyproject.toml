@@ -1,0 +1,26 @@
+[project]
+name = "latti-ai"
+version = "0.1.0"
+description = "Privacy-preserving AI inference using Fully Homomorphic Encryption"
+requires-python = ">=3.10"
+dependencies = [
+    # Inference / compiler
+    "networkx>=3.4.2",
+    # Training
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "numpy==2.2.6",
+    "tqdm>=4.67.1",
+    "onnx>=1.19.0",
+    "onnxruntime>=1.22.1",
+    "ordered-set>=4.1.0",
+    "typing_extensions>=4.15.0",
+    "graphviz>=0.21",
+    "h5py>=3.14.0",
+    "einops>=0.8.0",
+    "pillow>=11.0.0",
+    "pytest>=8.3.4",
+]
+
+[dependency-groups]
+dev = []

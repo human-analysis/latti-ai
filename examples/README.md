@@ -1,0 +1,76 @@
+# Examples
+
+This directory contains end-to-end encrypted inference examples. Each example requires a `task/` folder containing adapted model weights, compiled encrypted computation graphs, and configuration files. We provide pre-prepared `task/` folders so you can run directly, or generate them from scratch by following the [Quick Start](../README.md#quick-start) guide in the root README.
+
+## Examples Overview
+
+
+| Example         | Model       | Dataset  | Input Size    | Encryption     | Bootstrapping |
+| --------------- | ----------- | -------- | ------------- | -------------- | ------------- |
+| `test_mnist`    | Simple CNN  | MNIST    | 1 x 16 x 16   | CKKS (N=16384) | No            |
+| `test_cifar10`  | ResNet-20   | CIFAR-10 | 3 x 32 x 32   | CKKS (N=65536) | Yes           |
+| `test_imagenet` | MobileNetV2 | ImageNet | 3 x 256 x 256 | CKKS (N=65536) | Yes           |
+
+
+## Build
+
+Examples are built automatically as part of the main project build (see the root [Build & Install](../README.md#build--install) guide).
+
+## Run
+
+See the [Running Examples](../README.md#running-examples) section in the root README for instructions on running each example.
+
+## Verification
+
+The `inference` binary supports a `--verify` mode that compares encrypted inference results against plaintext results element-by-element, reporting per-element errors and overall pass/fail status.
+
+### Manual Verification
+
+```bash
+# CPU mode
+./build/examples/inference --task-dir examples/test_mnist/task --input examples/test_mnist/task/client/img.csv --verify
+
+# GPU mode
+./build/examples/inference --task-dir examples/test_mnist/task --input examples/test_mnist/task/client/img.csv --verify --gpu
+```
+
+### Batch Verification with CTest
+
+All examples are registered as CTest tests with labels for easy filtering. Run from the `build/` directory:
+
+```bash
+ctest -L example-cpu -V          # All CPU examples
+ctest -L example-gpu -V          # All GPU examples
+ctest -R mnist -V                # MNIST only (CPU + GPU)
+ctest -R cifar10-gpu -V          # CIFAR-10 GPU only
+ctest -L example -V              # All examples (CPU + GPU)
+```
+
+Available labels: `example`, `example-cpu`, `example-gpu`, `mnist`, `cifar10`, `imagenet`.
+
+## Example Details
+
+### test_mnist
+
+The simplest example — a small CNN for MNIST digit classification. Uses standard CKKS without bootstrapping. Good starting point for understanding the framework.
+
+- **Input**: 16x16 grayscale image (1 channel)
+- **Output**: 10-class logits (digits 0-9)
+- **Poly degree**: N = 16384
+
+### test_cifar10
+
+ResNet-20 on CIFAR-10 with bootstrapping enabled to support the deeper network. Demonstrates the framework's ability to handle residual connections and deeper computation graphs.
+
+- **Input**: 32x32 RGB image (3 channels)
+- **Output**: 10-class logits
+- **Poly degree**: N = 65536
+
+### test_imagenet
+
+MobileNetV2 on ImageNet — a larger-scale example with 1000-class classification. Shows encrypted inference on production-grade models.
+
+- **Input**: 256x256 RGB image (3 channels)
+- **Output**: 1000-class logits
+- **Poly degree**: N = 65536
+

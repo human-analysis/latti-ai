@@ -1,0 +1,308 @@
+# Copyright (c) 2025-2026 CipherFlow (Shenzhen) Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+from pathlib import Path
+
+import components
+from components import LayerAbstractGraph, config, PN13QP218, PN14QP438, PN15QP880, PN16QP1761, N16QP1546H192H32, CryptoFaceNet4H192H32
+import processor
+from processor import *
+from graph_partition_dp import *
+
+
+def prepare_graph(raw_graph: LayerAbstractGraph) -> LayerAbstractGraph:
+    """
+    Prepare graph for compilation (common preparation steps)
+
+    Args:
+        raw_graph: Raw LayerAbstractGraph loaded from json
+
+    Returns:
+        Prepared LayerAbstractGraph
+    """
+    pt_graph = copy.deepcopy(raw_graph)
+
+    substitute_layers_for_btp(pt_graph)
+    # transforms.init_levels(pt_graph)
+    # update_shape_for_btp(pt_graph)
+    # update_skip_for_btp(pt_graph)
+    # update_level_cost_for_btp(pt_graph)
+    set_is_adaptive_avgpool(pt_graph)
+    transforms.split_upsampling_layers(pt_graph)
+    transforms.infer_shapes_skips_and_pack_num(pt_graph)
+    transforms.combine_convs_with_upsamples(pt_graph)
+    transforms.set_level_costs(pt_graph)
+
+    transforms.absorb_scale(pt_graph)
+
+    return pt_graph
+
+
+def set_block_shape(params, raw_graph: LayerAbstractGraph):
+    """Set config.block_shape based on the input graph's leading feature node shape and N.
+
+    Rules:
+      (1) If leading node is not 2D, use sqrt(N/2) as a square default.
+      (2) If shape0 * shape1 <= N / 2, block_shape = [shape0, shape1]
+      (3) Otherwise, divide both shape0 and shape1 by 2, 4, 8, 16, ...,
+          until shape0 * shape1 < N / 2
+    """
+    slot_num = params.poly_modulus_degree // 2
+    leading_nodes = raw_graph.get_leading_feature_nodes()
+    if not leading_nodes or len(leading_nodes[0].shape) < 2:
+        side = 1 << (slot_num.bit_length() // 2)
+        config.block_shape = [side, side]
+        return
+    shape0, shape1 = leading_nodes[0].shape[0], leading_nodes[0].shape[1]
+    slot_num = params.poly_modulus_degree // 2
+    # threshold = N / 2
+    while shape0 * shape1 > slot_num:
+        s0, s1 = shape0 // 2, shape1 // 2
+        shape0, shape1 = s0, s1
+
+    # params.block_shape = [shape0, shape1]
+    config.block_shape = [shape0, shape1]
+    print('block_shape=', config.block_shape)
+
+
+def try_no_btp(raw_graph: LayerAbstractGraph) -> tuple[bool, LayerAbstractGraph | None, float]:
+    """
+    Try no-BTP mode compilation with prepared graph
+
+    Args:
+        raw_graph: Raw LayerAbstractGraph
+
+    Returns:
+        (succeeded, graph, score): succeeded=True if no-BTP succeeded, graph and score are set on success
+    """
+    print('Step 2: Trying no-BTP mode...')
+
+    no_btp_params = [PN13QP218, PN14QP438, PN15QP880, PN16QP1761]
+
+    for params in no_btp_params:
+        config.fhe_param = params
+        set_block_shape(config.fhe_param, raw_graph)
+        print(f'Trying FheParam {config.fhe_param.name}')
+
+        # (1) Pre-process
+        pt_graph = prepare_graph(raw_graph)
+
+        # (2) Process
+        result = process_with_no_btp(pt_graph)
+
+        # (3) Post-process
+        if result is not None:
+            print(f'Success! Using FheParam {config.fhe_param.name}')
+            print('✓ No-BTP mode succeeded! Saving results...')
+            restore_node_attributes(result.dag)
+            result = post_process(result)
+            return True, result, 0.0
+        else:
+            print(f'Level exceeded with POLY_N={config.fhe_param.poly_modulus_degree}, trying next level...')
+
+    print(f'Warning: Even with POLY_N=65536, level still exceeds limit!')
+    print('✗ No-BTP mode failed, switching to BTP mode...')
+    return False, None, float('inf')
+
+
+def process_with_no_btp(graph: LayerAbstractGraph):
+    return reset_level_and_check_level(graph)
+
+
+def try_btp(
+    num_experiments: int,
+    raw_graph: LayerAbstractGraph,
+    temperature: float,
+    num_workers: int,
+    btp_params: list | None = None,
+) -> tuple[bool, LayerAbstractGraph | None, float]:
+    btp_param_list = btp_params if btp_params is not None else [N16QP1546H192H32]
+    valid_results = []
+    for params in btp_param_list:
+        config.fhe_param = params
+        set_block_shape(config.fhe_param, raw_graph)
+
+        # (1) Pre-process
+        pt_graph = prepare_graph(raw_graph)
+
+        # (2) Process
+        graph, score = run_btp_compilation(num_experiments, pt_graph, temperature, num_workers)
+
+        # (3) Post-process
+        if graph is not None:
+            graph = post_process(graph)
+            valid_results.append((score, graph, params))
+
+    if not valid_results:
+        return False, None, float('inf')
+
+    best_score, best_graph, best_params = min(valid_results, key=lambda x: x[0])
+    config.fhe_param = best_params  # restore so dump_graph writes correct CKKS params
+    return True, best_graph, best_score
+
+
+def run_btp_compilation(
+    num_experiments: int,
+    pt_graph: LayerAbstractGraph,
+    temperature: float,
+    num_workers: int,
+) -> tuple[LayerAbstractGraph | None, float]:
+    """
+    Run BTP mode parallel compilation with prepared graph
+
+    Args:
+        num_experiments: Number of parallel compilation runs
+        temperature: Temperature parameter for randomization
+        pt_graph: Prepared graph for BTP compilation
+        num_workers: Number of parallel worker processes
+
+    Returns:
+        (best_graph, best_score): best_graph is None if all runs failed
+    """
+    print(f'Step 4: Starting {num_experiments} parallel BTP compilations with {num_workers} processes...')
+
+    # Prepare arguments for each run
+    args_list = [(copy.deepcopy(pt_graph), temperature) for _ in range(num_experiments)]
+
+    # Run compilations in parallel
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        results = list(executor.map(run_single_compile, args_list))
+
+    # Filter out failed results
+    valid_results = [(score, graph) for score, graph in results if graph is not None]
+    failed_count = num_experiments - len(valid_results)
+
+    print(f'\n=== Summary ===')
+    print(f'Total runs: {num_experiments}')
+    print(f'Successful: {len(valid_results)}')
+    print(f'Failed (level limit exceeded): {failed_count}')
+
+    if not valid_results:
+        print('ERROR: All runs failed! No valid results to save.')
+        return None, float('inf')
+
+    # Find the best result
+    best_score, best_graph = min(valid_results, key=lambda x: x[0])
+
+    print(f'\n=== Results ===')
+    print(f'Best score: {best_score}')
+    return best_graph, best_score
+
+
+def post_process(graph: LayerAbstractGraph):
+    slot_num = config.fhe_param.poly_modulus_degree / 2
+    for node in graph.dag.nodes:
+        if isinstance(node, ComputeNode):
+            node.up_scale_str = list()
+            node.down_scale_str = list()
+            transforms.populate_pack_num(graph.dag, node, slot_num)
+
+    transforms.set_graph_scale(graph)
+    process_levels(graph)
+
+    return graph
+
+
+def dump_graph(
+    graph: LayerAbstractGraph,
+    output_dir: Path,
+    score: float,
+    use_btp: bool,
+):
+    task_dir = output_dir / 'task'
+    server_dir = task_dir / 'server'
+    client_dir = task_dir / 'client'
+    ergs_dir = server_dir
+
+    ergs_dir.mkdir(parents=True, exist_ok=True)
+    client_dir.mkdir(parents=True, exist_ok=True)
+
+    erg0_path = ergs_dir / 'nn_layers_ct_0.json'
+    graph.to_json(dict(), str(erg0_path), score=score)
+
+    if use_btp:
+        graph_to_task_config(graph, str(server_dir))
+    else:
+        graph_to_task_config(graph, str(server_dir), False)
+
+    server_task_config = server_dir / 'task_config.json'
+    client_task_config = client_dir / 'task_config.json'
+    if server_task_config.exists():
+        shutil.copy(str(server_task_config), str(client_task_config))
+
+    ckks_param = {'param0': {**config.fhe_param.to_dict(), 'pack_num': 4.0}}
+
+    with open(server_dir / 'ckks_parameter.json', 'w') as f:
+        json.dump(ckks_param, f, indent=4)
+
+    with open(client_dir / 'ckks_parameter.json', 'w') as f:
+        json.dump(ckks_param, f, indent=4)
+
+
+def run_pipeline(
+    num_experiments: int,
+    input_file_path: Path,
+    output_dir: Path,
+    temperature: float = 0.0,
+    num_workers: int = 16,
+    style: str | None = None,
+    graph_type: str | None = None,
+    output_level: int = 0,
+    btp_params: list | None = None,
+    force_btp: bool = False,
+):
+    """
+    Run multiple compilations in parallel and select the best result
+
+    This is the main entry point for compilation. It tries no-BTP mode first,
+    and falls back to BTP mode if needed.
+
+    Args:
+        num_experiments: Number of parallel compilation runs
+        input_file_path: Input pt.json file path
+        output_dir: Output directory (will contain erg0.json, task_config.json)
+        temperature: Temperature parameter for randomization
+        num_workers: Number of parallel worker processes
+        style: Computation style (STYLE)
+        graph_type: Graph type (GRAPH_TYPE)
+        output_level: Desired FHE level of the output ciphertext (default 0).
+            Set to > 0 to reserve levels for post-inference operations (e.g. inner product).
+        force_btp: Skip no-BTP mode and go directly to BTP mode.
+    """
+    if style is not None:
+        config.style = style
+    if graph_type is not None:
+        config.graph_type = graph_type
+    config.output_level = output_level
+    print(f'Configuration initialized: STYLE={config.style}, GRAPH_TYPE={config.graph_type}, OUTPUT_LEVEL={config.output_level}')
+
+    raw_graph = LayerAbstractGraph.from_json(input_file_path)
+
+    use_btp = False
+    if not force_btp:
+        succeeded, graph, score = try_no_btp(raw_graph)
+    else:
+        succeeded = False
+    if not succeeded:
+        use_btp = True
+        succeeded, graph, score = try_btp(num_experiments, raw_graph, temperature, num_workers, btp_params=btp_params)
+        if not succeeded:
+            raise ValueError('Compilation failed.')
+
+    dump_graph(graph, output_dir, score, use_btp=use_btp)
+
+    return graph, score
